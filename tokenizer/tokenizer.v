@@ -100,6 +100,8 @@ mut:
 	next_input_char rune
 
 	curr_token Token = EOFToken{}
+
+	bldr strings.Builder
 }
 
 fn exit_state_not_implemented(state TokenizerState) {
@@ -149,24 +151,38 @@ fn (mut t Tokenizer) switch_state(state TokenizerState, params SwitchStateParams
 			0
 		}
 	}
-	t.do_state(t.state)
+	
+	match t.state {
+		.data { t.do_state_data() }
+		.tag_open { t.do_state_tag_open() }
+		.markup_declaration_open { t.do_state_markup_declaration_open() }
+		.doctype { t.do_state_doctype() }
+		.before_doctype_name { t.do_state_before_doctype_name() }
+		.doctype_name { t.do_state_doctype_name() }
+		else { exit_state_not_implemented(t.state) }
+	}
 }
 
 // checks if the next characters match `look_for` and moves the cursor
 // forward `look_for.len`. Returns none if next characters do not
 // match `look_for`.
-fn (mut t Tokenizer) look_ahead(look_for string) ? {
+fn (mut t Tokenizer) look_ahead(look_for string) ?bool {
 	tmp := look_for.runes()
 	for i in 0..look_for.len {
 		if x := t.peek_codepoint(i) {
 			if x != tmp[i] {
-				return
+				return none
 			}
 		} else {
-			return
+			return none
 		}
 	}
 	t.cursor += look_for.len
+	return true
+}
+
+fn (t &Tokenizer) push_token(tok Token) {
+	println(tok)
 }
 
 pub fn (mut t Tokenizer) run() {
@@ -174,21 +190,13 @@ pub fn (mut t Tokenizer) run() {
 		println('Cannot tokenize empty array.')
 		return
 	}
-	t.do_state(t.state)
-}
-
-fn (mut t Tokenizer) do_state(state TokenizerState) {
-	match t.state {
-		.data { t.do_state_data() }
-		.char_reference { t.do_state_char_reference() }
-		else { exit_state_not_implemented(t.state) }
-	}
+	t.switch_state(t.state, reconsume: true)
 }
 
 fn (mut t Tokenizer) do_state_data() {
 	match t.curr_input_char {
 		`&` {
-			t.switch_state(.char_reference)
+			// t.switch_state(.char_reference)
 		}
 		`<` {
 			t.switch_state(.tag_open)
@@ -202,13 +210,9 @@ fn (mut t Tokenizer) do_state_data() {
 	}
 }
 
-fn (mut t Tokenizer) do_state_char_reference() {
-	exit_state_not_implemented(.char_reference)
-}
-
 fn (mut t Tokenizer) do_state_tag_open() {
 	if t.curr_input_char == `!` {
-		t.switch_state(.markup_declaration_open)
+		t.switch_state(.markup_declaration_open, reconsume: true)
 	}
 }
 
@@ -226,51 +230,41 @@ fn (mut t Tokenizer) do_state_markup_declaration_open() {
 }
 
 fn (mut t Tokenizer) do_state_doctype() {
-	// in properly formatted html, whitespace is required here
-	// so we'll use likely for optimization
-	if _likely_(t.curr_input_char in whitespace) {
+	if t.state == .@none {
+
+	} else if _likely_(t.curr_input_char in whitespace) {
 		t.switch_state(.before_doctype_name)
 	} else if t.curr_input_char == `>` {
 		t.switch_state(.before_doctype_name, reconsume: true)
+	} else {
+
 	}
 }
 
 fn (mut t Tokenizer) do_state_before_doctype_name() {
 	t.curr_token = DoctypeToken{}
-	for {
-		if t.state == .@none {
-			mut token := t.curr_token as DoctypeToken
-			token.force_quirks = true
-			eof := EOFToken{}
-
-			break
-		} if t.curr_input_char in ascii_upper {
-
-			break
-		} else if _unlikely_(t.curr_input_char == null) {
-
-			break
-		} else if _unlikely_(t.curr_input_char == `>`) {
-
-			break
-		} else if t.curr_input_char in whitespace {
-			
-		} else {
-			mut token := t.curr_token as DoctypeToken
-			token.name = t.curr_input_char.str()
-			t.switch_state(.doctype_name)
-
-			break
-		}
-		
-		t.curr_input_char = t.next_codepoint() or {
-			println(err.msg())
-			t.state = .@none
-			break
-		}
+	if t.state == .@none {
+	} else if t.curr_input_char in ascii_upper {
+	} else if _unlikely_(t.curr_input_char == null) {
+	} else if _unlikely_(t.curr_input_char == `>`) {
+	} else if t.curr_input_char in whitespace {
+	} else {
+		t.bldr = strings.new_builder(0)
+		t.bldr.write_rune(t.curr_input_char)
+		t.switch_state(.doctype_name)
 	}
 }
 
 fn (mut t Tokenizer) do_state_doctype_name() {
-	
+	if t.state == .@none {
+	} else if t.curr_input_char in whitespace {
+	} else if t.curr_input_char == `>` {
+		mut token := t.curr_token as DoctypeToken
+		token.name = t.bldr.str()
+		t.push_token(Token(token))
+	} else if t.curr_input_char == null {
+	} else {
+		t.bldr.write_rune(t.curr_input_char)
+		t.switch_state(.doctype_name)
+	}
 }
