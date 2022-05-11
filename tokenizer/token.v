@@ -47,4 +47,6 @@ mut:
 
 struct EOFToken {
 	typ TokenType = .eof
+	name string
+	msg string
 }
