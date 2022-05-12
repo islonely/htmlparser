@@ -5,8 +5,12 @@ import strings
 const (
 	whitespace = [rune(`\t`), `\n`, `\f`, ` `]
 	null = rune(0)
+
 	ascii_upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.runes()
 	ascii_lower = 'abcdefghijklmnopqrstuvwxyz'.runes()
+	ascii_numeric = '123455678890'.runes()
+	ascii_alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'.runes()
+	ascii_alphanumeric = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.runes()
 )
 
 enum TokenizerState {
@@ -212,7 +216,9 @@ fn (mut t Tokenizer) push_token(tok Token) {
 }
 
 pub fn (mut t Tokenizer) run() Ast {
-	t.switch_state(.data)
+	for t.state != .eof {
+		t.switch_state(.data)
+	}
 	return t.ast
 }
 
@@ -229,12 +235,8 @@ fn (mut t Tokenizer) do_state_after_doctype_name() {
 		token.force_quirks = true
 		t.push_token(token)
 		t.push_token(EOFToken{
-			name: 'EOF in doctype.'
-			msg: 'This error occurs if the parser encounter the end
-				  of the input stream in a DOCTYPE. In such a case,
-				  if the DOCTYPE is correctly placed as a document
-				  preamble, the parser sets the Document to quirks
-				  mode.'
+			name: eof_doctype_name
+			msg: eof_doctype_msg
 		})
 	} else if t.curr_input_char in whitespace {
 		t.switch_state(.after_doctype_name)
@@ -263,8 +265,8 @@ fn (mut t Tokenizer) do_state_bogus_doctype() {
 	if t.state == .eof {
 		t.push_token(t.curr_token)
 		t.push_token(EOFToken{
-			name: 'EOF'
-			msg: 'Reached the end of file.'
+			name: eof_doctype_name
+			msg: eof_doctype_msg
 		})
 	} else if t.curr_input_char == `>` {
 		t.push_token(t.curr_token)
@@ -277,16 +279,46 @@ fn (mut t Tokenizer) do_state_bogus_doctype() {
 	}
 }
 
+// 13.2.5.72 Character reference state
+//
+// see spec:
+// https://html.spec.whatwg.org/multipage/parsing.html#character-reference-state
+fn (mut t Tokenizer) do_state_char_reference() {
+	if t.curr_input_char in ascii_alphanumeric {
+		t.switch_state(.named_char_reference, reconsume: true)
+	} else if t.curr_input_char == `#` {
+		t.bldr.write_rune(t.curr_input_char)
+		t.switch_state(.num_char_reference)
+	} else {
+		// t.flush_code_point
+		// t.switch_state(.return)
+	}
+}
 
+// 13.2.5.73 Named character reference state
+//
+// see spec:
+// https://html.spec.whatwg.org/multipage/parsing.html#named-character-reference-state
+fn (mut t Tokenizer) do_state_named_char_reference() {
+	if true {
+
+	} else {
+		// t.flush_code_point
+		// t.switch_state(.return)
+	}
+}
 
 
 
 // needs to be alphabetized
 
+// 13.2.5.1 Data state
 fn (mut t Tokenizer) do_state_data() {
 	match t.curr_input_char {
 		`&` {
-			// t.switch_state(.char_reference)
+			t.bldr = strings.new_builder(0)
+			t.bldr.write_rune(`&`)
+			t.switch_state(.char_reference)
 		}
 		`<` {
 			t.switch_state(.tag_open)
@@ -300,9 +332,29 @@ fn (mut t Tokenizer) do_state_data() {
 	}
 }
 
+// 13.2.5.6 Tag open state
 fn (mut t Tokenizer) do_state_tag_open() {
-	if t.curr_input_char == `!` {
+	if t.state == .eof {
+		t.push_token(CharacterToken{data: `<`})
+		t.push_token(EOFToken{
+			name: eof_before_tag_name_name
+			msg: eof_before_tag_name_msg
+		})
+	} if t.curr_input_char == `!` {
 		t.switch_state(.markup_declaration_open, reconsume: true)
+	} else if t.curr_input_char == `/` {
+		t.switch_state(.end_tag_open)
+	} else if t.curr_input_char in ascii_alpha {
+		t.curr_token = Token(TagToken{})
+		t.switch_state(.tag_name)
+	} else if t.curr_input_char == `?` {
+		println('Parser Error: unexpected question mark instead of tag name')
+		t.curr_token = Token(CommentToken{})
+		t.switch_state(.bogus_comment, reconsume: true)
+	} else {
+		println('Parser Error: invalid first character of tag name')
+		t.push_token(CharacterToken{data: `<`})
+		t.switch_state(.data, reconsume: true)
 	}
 }
 
@@ -319,32 +371,55 @@ fn (mut t Tokenizer) do_state_markup_declaration_open() {
 	}
 }
 
+// 13.2.5.53 DOCTYPE state
 fn (mut t Tokenizer) do_state_doctype() {
 	if t.state == .eof {
-
+		t.push_token(t.curr_token)
+		t.push_token(EOFToken{
+			name: eof_doctype_name
+			msg: eof_doctype_msg
+		})
 	} else if _likely_(t.curr_input_char in whitespace) {
 		t.switch_state(.before_doctype_name)
 	} else if t.curr_input_char == `>` {
 		t.switch_state(.before_doctype_name, reconsume: true)
 	} else {
-
+		println('Parse Error: Missing whitespace before DOCTYPE name')
+		t.switch_state(.before_doctype_name, reconsume: true)
 	}
 }
 
+// 13.2.5.54 Before DOCTYPE name state
 fn (mut t Tokenizer) do_state_before_doctype_name() {
 	t.curr_token = DoctypeToken{}
 	if t.state == .eof {
-	} else if t.curr_input_char in ascii_upper {
-	} else if _unlikely_(t.curr_input_char == null) {
+		t.push_token(t.curr_token)
+		t.push_token(EOFToken{
+			name: eof_doctype_name
+			msg: eof_doctype_msg
+		})
+	}
+	// do this in else clause below
+	//else if t.curr_input_char in ascii_upper {
+	//	.bldr = strings.new_builder(0)
+	//	t.bldr.write_rune(rune_to_lower(t.curr_input_char))
+	//}
+	else if _unlikely_(t.curr_input_char == null) {
 	} else if _unlikely_(t.curr_input_char == `>`) {
+		mut token := t.curr_token as DoctypeToken
+		token.force_quirks = true
+		t.push_token(Token(token))
+		t.switch_state(.data)
 	} else if t.curr_input_char in whitespace {
+		t.switch_state(.before_doctype_name)
 	} else {
 		t.bldr = strings.new_builder(0)
-		t.bldr.write_rune(t.curr_input_char)
+		t.bldr.write_rune(rune_to_lower(t.curr_input_char))
 		t.switch_state(.doctype_name)
 	}
 }
 
+// 13.2.5.55 DOCTYPE name state
 fn (mut t Tokenizer) do_state_doctype_name() {
 	if t.state == .eof {
 	} else if t.curr_input_char in whitespace {
@@ -353,14 +428,18 @@ fn (mut t Tokenizer) do_state_doctype_name() {
 		mut token := t.curr_token as DoctypeToken
 		token.name = t.bldr.str()
 		t.push_token(Token(token))
+		t.switch_state(.data)
 	} else if t.curr_input_char == null {
-		
+		println('Parse Error: unexpected null character')
+		t.bldr.write_rune(0xfffd) // 0xfffd = �
+		t.switch_state(.doctype_name)
 	} else {
 		t.bldr.write_rune(t.curr_input_char)
 		t.switch_state(.doctype_name)
 	}
 }
 
+[inline]
 fn (t &Tokenizer) do_state_eof() {
 	println('End of file.')
 }
