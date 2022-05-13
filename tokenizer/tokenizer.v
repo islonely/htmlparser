@@ -4,14 +4,16 @@ import datatypes { Stack }
 import strings
 
 const (
-	whitespace = [rune(`\t`), `\n`, `\f`, ` `]
-	null = rune(0)
-	replacement_token = CharacterToken{data: 0xfffd}
+	whitespace        = [rune(`\t`), `\n`, `\f`, ` `]
+	null              = rune(0)
+	replacement_token = CharacterToken{
+		data: 0xfffd
+	}
 
-	ascii_upper = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.runes()
-	ascii_lower = 'abcdefghijklmnopqrstuvwxyz'.runes()
-	ascii_numeric = '123455678890'.runes()
-	ascii_alpha = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'.runes()
+	ascii_upper        = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.runes()
+	ascii_lower        = 'abcdefghijklmnopqrstuvwxyz'.runes()
+	ascii_numeric      = '123455678890'.runes()
+	ascii_alpha        = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'.runes()
 	ascii_alphanumeric = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.runes()
 )
 
@@ -28,7 +30,6 @@ enum TokenizerState {
 	attr_value_dbl_quoted
 	attr_value_sgl_quoted
 	attr_value_unquoted
-
 	before_attr_name
 	before_attr_value
 	before_doctype_name
@@ -37,7 +38,6 @@ enum TokenizerState {
 	before_doctype_system_identifier
 	bogus_comment
 	bogus_doctype
-
 	cdata_section
 	cdata_section_bracket
 	cdata_section_end
@@ -52,7 +52,6 @@ enum TokenizerState {
 	comment_lt_sign_bang_dash_dash
 	comment_start
 	comment_start_dash
-
 	data
 	decimal_char_reference
 	decimal_char_reference_start
@@ -62,22 +61,16 @@ enum TokenizerState {
 	doctype_public_identifier_sgl_quoted
 	doctype_system_identifier_dbl_quoted
 	doctype_system_identifier_sgl_quoted
-
 	end_tag_open
 	eof
-
 	hex_char_reference
 	hex_char_reference_start
-
 	markup_declaration_open
-
 	named_char_reference
 	@none
 	num_char_reference
 	num_char_reference_end
-
 	plaintext
-
 	rawtext
 	rawtext_end_tag_name
 	rawtext_end_tag_open
@@ -86,7 +79,6 @@ enum TokenizerState {
 	rcdata_end_tag_name
 	rcdata_end_tag_open
 	rcdata_lt_sign
-
 	self_closing_start_tag
 	script_data
 	script_data_double_escape_end
@@ -104,7 +96,6 @@ enum TokenizerState {
 	script_data_escaped_end_tag_name
 	script_data_escaped_lt_sign
 	script_data_lt_sign
-
 	tag_name
 	tag_open
 }
@@ -112,21 +103,22 @@ enum TokenizerState {
 struct Tokenizer {
 mut:
 	return_state Stack<TokenizerState>
-	state TokenizerState = .data
+	state        TokenizerState = .data
 
-	cursor int
+	cursor    int
 	curr_char rune
 
 	curr_token Token = EOFToken{}
+	open_tags Stack<TagToken>
 
 	bldr strings.Builder
 pub mut:
-	input []rune
-	ast Ast
+	input  []rune
+	tokens []Token
 }
 
 fn exit_state_not_implemented(state TokenizerState) {
-	println('fn do_state_${state} not implemented. Exiting...')
+	println('fn do_state_$state not implemented. Exiting...')
 	exit(1)
 }
 
@@ -142,27 +134,32 @@ fn (mut t Tokenizer) next_codepoint() ?rune {
 	}
 
 	t.cursor++
-	return t.input[t.cursor-1]
+	return t.input[t.cursor - 1]
 }
 
 // gets the next value in buffer
 fn (t &Tokenizer) peek_codepoint(offset int) ?rune {
-	if t.cursor+offset >= t.input.len {
+	if t.cursor + offset >= t.input.len {
 		return error('End of file.')
 	}
-	return t.input[t.cursor+offset]
+	return t.input[t.cursor + offset]
 }
 
 [params]
 struct SwitchStateParams {
 	return_to TokenizerState = .@none
+	reconsume bool
 }
 
 // saves the current state, changes the state, consumes the next
 // character, and invokes the next do_state function.
 fn (mut t Tokenizer) switch_state(state TokenizerState, params SwitchStateParams) {
 	t.state = state
-	
+
+	if params.reconsume {
+		t.cursor--
+	}
+
 	match t.state {
 		.after_attr_name { t.do_state_after_attr_name() }
 		.after_attr_value_quoted { t.do_state_after_attr_value_quoted() }
@@ -201,7 +198,7 @@ struct LookAheadParams {
 // match `look_for`.
 fn (mut t Tokenizer) look_ahead(look_for string, params LookAheadParams) ?bool {
 	tmp := look_for.runes()
-	for i in 0..look_for.len {
+	for i in 0 .. look_for.len {
 		if x := t.peek_codepoint(i) {
 			if params.case_sensitive {
 				if x != tmp[i] {
@@ -220,16 +217,38 @@ fn (mut t Tokenizer) look_ahead(look_for string, params LookAheadParams) ?bool {
 	return true
 }
 
+[inline]
 fn (mut t Tokenizer) push_token(tok Token) {
-	t.ast.tokens << tok
+	t.tokens << tok
 }
 
-pub fn (mut t Tokenizer) run(html []rune) Ast {
+[inline]
+fn (mut t Tokenizer) push_char() {
+	t.push_rune(t.curr_char)
+}
+
+[inline]
+fn (mut t Tokenizer) push_rune(r rune) {
+	t.push_token(CharacterToken{ data: r })
+}
+
+[inline]
+fn (mut t Tokenizer) push_string(str string) {
+	for r in str.runes() {
+		t.push_rune(r)
+	}
+}
+
+[inline]
+fn (mut t Tokenizer) push_eof(tok EOFToken) {
+	t.push_token(tok)
+})
+
+pub fn (mut t Tokenizer) run(html []rune) {
 	t.input = html
 	for t.state != .eof {
 		t.switch_state(.data)
 	}
-	return t.ast
 }
 
 [inline]
@@ -247,10 +266,7 @@ fn (t &Tokenizer) parse_error(typ ParseError) {
 // 13.2.5.1
 fn (mut t Tokenizer) do_state_data() {
 	t.curr_char = t.next_codepoint() or {
-		t.push_token(EOFToken{
-			name: 'EOF'
-			msg: 'End of file has been reached.'
-		})
+		t.push_eof()
 		return
 	}
 
@@ -264,20 +280,17 @@ fn (mut t Tokenizer) do_state_data() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == null) {
+	if _unlikely_(t.curr_char == tokenizer.null) {
 		t.parse_error(.unexpected_null_character)
 	}
 
-	t.push_token(CharacterToken{data: t.curr_char})
+	t.push_char()
 }
 
 // 13.2.5.2
 fn (mut t Tokenizer) do_state_rcdata() {
 	t.curr_char = t.next_codepoint() or {
-		t.push_token(EOFToken{
-			name: 'EOF'
-			msg: 'End of file has been reached.'
-		})
+		t.push_eof()
 		return
 	}
 
@@ -291,9 +304,364 @@ fn (mut t Tokenizer) do_state_rcdata() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == null) {
-		t.push_token(replacement_token)
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.push_token(tokenizer.replacement_token)
 	}
 
-	t.push_token(CharacterToken{data: t.curr_char})
+	t.push_char()
+}
+
+// 13.2.5.3
+fn (mut t Tokenizer) do_state_rawtext() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_eof()
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.push_token(tokenizer.replacement_token)
+		return
+	}
+
+	t.push_char()
+}
+
+// 13.2.5.4
+fn (mut t Tokenizer) do_state_script_data() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_eof()
+		return
+	}
+
+	if t.curr_char == `<` {
+		t.switch_state(.script_data_lt_sign)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.push_token(tokenizer.replacement_token)
+		return
+	}
+
+	t.push_char()
+}
+
+// 13.2.5.5
+fn (mut t Tokenizer) do_state_plaintext() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_eof()
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.push_token(tokenizer.replacement_token)
+		return
+	}
+
+	t.push_char()
+}
+
+// 13.2.5.6
+fn (mut t Tokenizer) do_state_tag_open() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_before_tag_name)
+		t.push_char()
+		t.push_eof(
+			name: eof_before_tag_name_name
+			msg: eof_before_tag_name_msg
+		)
+		return
+	}
+
+	if t.curr_char == `!` {
+		t.switch_state(.markup_declaration_open)
+		return
+	}
+
+	if t.curr_char == `/` {
+		t.switch_state(.end_tag_open)
+		return
+	}
+
+	if t.curr_char in tokenizer.ascii_alpha {
+		t.curr_token = TagToken{}
+		t.switch_state(.tag_name, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `?` {
+		t.parse_error(.unexpected_question_mark_instead_of_tag_name)
+		t.switch_state(.bogus_comment, reconsume: true)
+		return
+	}
+
+	t.parse_error(.invalid_first_character_of_tag_name)
+	// spec says to emit lt sign char token. Not sure if this will cause problems
+	// later down the line, but since fn do_state_tag_open() is not invoked unless
+	// we encounter a lt sign it should be effectively the same thing. Just
+	// leaving a note in case I have issues later.
+	t.push_char()
+	t.switch_state(.data, reconsume: true)
+}
+
+// 13.2.5.7
+fn (mut t Tokenizer) do_state_end_tag_open() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_before_tag_name)
+		t.push_char()
+		t.push_eof(
+			name: eof_before_tag_name_name
+			msg: eof_before_tag_name_msg
+		)
+		return
+	}
+
+	if t.curr_char in tokenizer.ascii_alpha {
+		t.curr_token = TagToken{
+			typ: .end_tag
+		}
+		t.switch_state(.tag_name, reconsume: true)
+		return
+	}
+
+	if _unlikely_(t.curr_char == `>`) {
+		t.parse_error(.missing_end_tag_name)
+		t.switch(.data)
+		return
+	}
+
+	t.parse_error(.invalid_first_character_of_tag_name)
+	t.curr_token = CommentToken{}
+	t.switch_state(.bogus_comment, reconsume: true)
+}
+
+// 13.2.5.8
+fn (mut t Tokenizer) do_state_tag_name() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_tag)
+		t.push_eof(
+			name: eof_in_tag_name
+			msg: eof_in_tag_msg
+		)
+		return
+	}
+
+	if t.curr_char in tokenizer.whitespace {
+		t.switch_state(.before_attr_name)
+		return
+	}
+
+	if t.curr_char == `/` {
+		t.switch_state(.self_closing_start_tag)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		if (t.curr_token as TagToken).typ == .start_tag {
+			t.open_tags.push(t.curr_token)
+		}
+		t.switch_state(.data)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.push_token(tokenizer.replacement_token)
+		return
+	}
+
+	mut tok := t.curr_token as TagToken
+	tok.name += rune_to_lower(t.curr_char)
+	t.curr_token = tok
+}
+
+// 13.2.5.9
+fn (mut t Tokenizer) do_state_rcdata_lt_sign() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_rune(`<`)
+		t.switch_state(.rcdata, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `/` {
+		t.bldr = strings.new_builder(0)
+		t.switch_state(.rcdata_end_tag_open)
+		return
+	}
+
+	t.push_rune(`<`)
+	t.switch_state(.rcdata, reconsume: true)
+}
+
+// 13.2.5.10
+fn (mut t Tokenizer) do_state_rcdata_end_tag_open() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_string('</')
+		t.switch_state(.rcdata, reconsume: true)
+		return
+	}
+
+	if t.curr_char in tokenizer.ascii_alpha {
+		t.curr_token = TagToken{typ: .end_tag}
+		t.switch_state(.rcdata_end_tag_name, reconsume: true)
+	}
+
+	t.push_rune(`<`)
+	t.push_token(CharacterToken{ data: `/` })
+	t.switch_state(.rcdata, reconsume: true)
+}
+
+// 13.2.5.11
+fn (mut t Tokenizer) do_state_rcdata_end_tag_name() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_string('</')
+		t.push_string(t.bldr.str())
+		t.switch_state(.rcdata, reconsume: true)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		if (t.curr_token as TagToken).is_appropriate(t) {
+			t.switch_state(.before_attr_name)
+		} else {
+			t.push_string('</')
+			t.push_string(t.bldr.str())
+			t.switch_state(.rcdata, reconsume: true)
+		}
+		return
+	} 
+	
+	if t.curr_char == `/` {
+		if (t.curr_token as TagToken).is_appropriate(t) {
+			t.switch_state(.self_closing_start_tag)
+		} else {
+			t.push_string('</')
+			t.push_string(t.bldr.str())
+			t.switch_state(.rcdata, reconsume: true)
+		}
+		return
+	}
+
+	if t.curr_char == `>` {
+		if (t.curr_token as TagToken).is_appropriate(t) {
+			t.push_token(t.curr_token)
+			t.switch_state(.data)
+		} else {
+			t.push_string('</')
+			t.push_string(t.bldr.str())
+			t.switch_state(.rcdata, reconsume: true)
+		}
+		return
+	}
+
+	if t.curr_char in ascii_alpha {
+		mut tok := t.curr_token as TagToken
+		tok.name += rune_to_lower(t.curr_char).str()
+		t.curr_token = tok
+		t.bldr.write_rune(t.curr_char)
+		t.switch_state(.rcdata_end_tag_name)
+		return
+	}
+
+	t.push_string('</')
+	t.push_string(t.bldr.str())
+	t.switch_state(.rcdata, reconsume: true)
+}
+
+// 13.2.5.12
+fn (mut t Tokenizer) do_state_rawtext_lt_sign() {
+	t.curr_char = t.next_codepoint() or {
+		t.write_rune(`<`)
+		t.switch_state(.rawtext, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `/` {
+		t.bldr = strings.new_builder(0)
+		t.switch_state(.rawtext_end_tag_open)
+		return
+	}
+
+	t.write_rune(`<`)
+	t.switch_state(.rawtext, reconsume: true)
+	return
+}
+
+// 13.2.5.13
+fn (mut t Tokenizer) do_state_rawtext_end_tag_open() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_string('</')
+		t.switch_state(.rawtext, reconsume: true)
+		return
+	}
+
+	if t.curr_char in ascii_alpha {
+		t.curr_token = TagToken{typ: .end_tag}
+		t.switch_state(.rawtext_end_tag_name, reconsume: true)
+		return
+	}
+
+	t.push_string('</')
+	t.switch_state(.rawtext, reconsume: true)
+}
+
+// 13.2.5.14
+fn (mut t Tokenizer) do_state_rawtext_end_tag_name() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_string('</')
+		t.push_string(t.bldr.str())
+		t.switch_state(.rawtext, reconsume: true)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		if (t.curr_token as TagToken).is_appropriate(t) {
+			t.switch_state(.before_attr_name)
+		} else {
+			t.push_string('</')
+			t.push_string(t.bldr.str())
+			t.switch_state(.rawtext, reconsume: true)
+		}
+		return
+	}
+
+	if t.curr_char == `/` {
+		if (t.curr_token as TagToken).is_appropriate(t) {
+			t.switch_state(.self_closing_start_tag)
+		} else {
+			t.push_string('</')
+			t.push_string(t.bldr.str())
+			t.switch_state(.rawtext, reconsume: true)
+		}
+		return
+	}
+
+	if t.curr_char == `>` {
+		if (t.curr_token as TagToken).is_appropriate(t) {
+			t.push_token(t.curr_token)
+			t.switch_state(.data)
+		} else {
+			t.push_string('</')
+			t.push_string(t.bldr.str())
+			t.switch_state(.rawtext, reconsume: true)
+		}
+		return
+	}
+
+	if t.curr_char in ascii_alpha {
+		mut tok := t.curr_token as TagToken
+		tok.name += rune_to_lower(t.curr_char).str()
+		t.curr_token = tok
+		t.bldr.write_rune(t.curr_char)
+		t.switch_state(.rawtext_end_tag_name)
+		return
+	}
+
+	t.push_string('</')
+	t.push_string(t.bldr.str())
+	t.switch_state(.rawtext, reconsume: true)
 }
