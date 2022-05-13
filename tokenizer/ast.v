@@ -1,7 +1,7 @@
 module tokenizer
 
 struct Ast {
-mut:
+pub mut:
 	tokens []Token
 }
 

@@ -1,5 +1,8 @@
 module tokenizer
 
+import strings
+
+// end of file errors
 const(
 	eof_doctype_name = 'EOF in doctype.'
 	eof_doctype_msg = 'This error occurs if the parser encounter the end
@@ -13,6 +16,10 @@ const(
 								name is expected. In this case the parser
 								treats the beginning of a start tag (i.e., <)
 								or an end tag (i.e., </) as text content.'
+	eof_in_tag_name = 'EOF in tag.'
+	eof_in_tag_msg = 'This error occurs if the parser encounters the end
+						of the input stream in a start tag or an end tag
+						(e.g., <div id=). Such a tag is ignored.'
 
 )
 
@@ -47,6 +54,37 @@ mut:
 	name string
 	self_closing bool
 	attr map[string]string
+	children []Token
+}
+
+pub fn (t &TagToken) html() string {
+	return t.html_depth(0)
+}
+
+fn (t &TagToken) html_depth(depth int) string {
+	mut bldr := strings.new_builder(0)
+	bldr.write_string('  '.repeat(depth))
+	bldr.write_rune(`<`)
+	bldr.write_string(t.name)
+	if t.attr.len > 0 {
+		for key, val in t.attr {
+			bldr.write_string(' $key="$val"')
+		}
+	}
+	bldr.write_rune(`>`)
+
+	for child in t.children {
+		bldr.write_string(match child {
+			TagToken { child.html_depth(depth+1) }
+			CharacterToken { child.data.str() }
+			else { '<unimplemented token>' }
+		})
+	}
+
+	if !t.self_closing {
+		bldr.write_string('</$t.name>')
+	}
+	return bldr.str()
 }
 
 struct CommentToken {
