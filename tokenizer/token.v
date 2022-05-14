@@ -16,12 +16,17 @@ const (
 	eof_before_tag_name_msg  = 'This error occurs if the parser encounters
 								the end of the input stream where a tag
 								name is expected. In this case the parser
-								treats the beginning of a start tag (i.e., <)
-								or an end tag (i.e., </) as text content.'
+								treats the beginning of a start tag (i.e., `<`)
+								or an end tag (i.e., `</`) as text content.'
 	eof_in_tag_name = 'EOF in tag.'
 	eof_in_tag_msg  = 'This error occurs if the parser encounters the end
-						of the input stream in a start tag or an end tag
-						(e.g., <div id=). Such a tag is ignored.'
+					   of the input stream in a start tag or an end tag
+					   (e.g., `<div id=`). Such a tag is ignored.'
+	eof_in_script_html_comment_like_text_name = 'EOF in script HTML comment like text.'
+	eof_in_script_html_comment_like_text_msg  = 'This error occurs if the parser encounters
+												 the end of the input stream in text that
+												 resembles an HTML comment inside `script`
+												 element content (e.g., `<script><!-- foo`).'
 )
 
 enum TokenType {
