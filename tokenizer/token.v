@@ -128,3 +128,9 @@ struct EOFToken {
 	name string    = tokenizer.eof_generic_name
 	msg  string    = tokenizer.eof_generic_msg
 }
+
+struct Attribute {
+mut:
+	name strings.Builder = strings.new_builder(0)
+	value strings.Builder = strings.new_builder(0)
+}

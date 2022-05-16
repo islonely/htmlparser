@@ -108,6 +108,7 @@ mut:
 	cursor    int
 	curr_char rune
 
+	curr_attr  Attribute
 	curr_token Token = EOFToken{}
 	open_tags  Stack<TagToken>
 
@@ -1148,4 +1149,809 @@ fn (mut t Tokenizer) do_state_script_data_double_escaped() {
 
 	t.push_char()
 	t.switch_state(.script_data_double_escaped)
+}
+
+// 13.2.5.28
+fn (mut t Tokenizer) do_state_script_data_double_escaped_dash() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_script_html_comment_like_text)
+		t.push_eof(
+			name: eof_in_script_html_comment_like_text_name
+			msg: eof_in_script_html_comment_like_text_msg
+		)
+		return
+	}
+
+	if t.curr_char == `-` {
+		t.push_rune(`-`)
+		t.switch_state(.script_data_double_escaped_dash_dash)
+		return
+	}
+
+	if t.curr_char == `<` {
+		t.push_rune(`<`)
+		t.switch_state(.script_data_double_escaped_lt_sign)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.push_token(tokenizer.replacement_token)
+		t.switch_state(.script_data_double_escaped)
+		return
+	}
+
+	t.push_char()
+	t.switch_state(.script_data_double_escaped)
+}
+
+// 13.2.5.29
+fn (mut t Tokenizer) do_state_script_data_double_escaped_dash_dash() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_script_html_comment_like_text)
+		t.push_eof(
+			name: eof_in_script_html_comment_like_text_name
+			msg: eof_in_script_html_comment_like_text_msg
+		)
+		return
+	}
+
+	if t.curr_char == `-` {
+		t.push_rune(`-`)
+		return
+	}
+
+	if t.curr_char == `<` {
+		t.push_rune(`<`)
+		t.switch_state(.script_data_double_escaped_lt_sign)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_rune(`>`)
+		t.switch_state(.script_data)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.push_token(tokenizer.replacement_token)
+		t.switch_state(.script_data_double_escaped)
+		return
+	}
+
+	t.push_char()
+	t.switch_state(.script_data_double_escaped)
+}
+
+// 13.2.5.30
+fn (mut t Tokenizer) do_state_script_data_double_escaped_lt_sign() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.script_data_double_escaped, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `/` {
+		t.bldr = strings.new_builder(0)
+		t.push_rune(`/`)
+		t.switch_state(.script_data_double_escape_end)
+		return
+	}
+
+	t.switch_state(.script_data_double_escaped, reconsume: true)
+}
+
+// 13.2.5.31
+fn (mut t Tokenizer) do_state_script_data_double_escape_end() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.script_data_double_escaped, reconsume: true)
+		return
+	}
+
+	if t.curr_char in tokenizer.whitespace || t.curr_char in [`/`, `>`] {
+		buf := t.bldr.str()
+		t.bldr = strings.new_builder(buf.len)
+		t.bldr.write_string(buf)
+
+		if buf == 'script' {
+			t.switch_state(.script_data_escaped)
+		} else {
+			t.push_char()
+			t.switch_state(.script_data_double_escaped)
+		}
+		return
+	}
+
+	if t.curr_char in tokenizer.ascii_alpha {
+		t.bldr.write_rune(rune_to_lower(t.curr_char))
+		t.push_char()
+		return
+	}
+
+	t.switch_state(.script_data_double_escaped, reconsume: true)
+}
+
+// 13.2.5.32
+fn (mut t Tokenizer) do_state_before_attr_name() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.after_attr_name, reconsume: true)
+		return
+	}
+
+	if t.curr_char in tokenizer.whitespace {
+		t.switch_state(.do_state_before_attr_name)
+		return
+	}
+
+	if t.curr_char in [`/`, `>`] {
+		t.switch_state(.after_attr_name, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `=` {
+		t.parse_error(.unexpected_equals_sign_before_attr_name)
+		t.curr_attr.name.write_rune(t.curr_char)
+		t.switch_state(.attr_name)
+		return
+	}
+
+	t.curr_attr = Attribute{}
+	t.switch_state(.attr_name, reconsume: true)
+}
+
+// 13.2.5.33
+fn (mut t Tokenizer) do_state_attr_name() {
+	t.curr_char = t.next_codepoint() or {
+		if _unlikely_(t.attr.name.str() in (t.curr_token as TagToken).attr) {
+			t.parse_error(.deplicate_attr)
+		}
+		t.switch_state(.after_attr_name, reconsume: true)
+		return
+	}
+
+	if t.curr_char in tokenizer.whitespace {
+		t.switch_state(.after_attr_name)
+		return
+	}
+
+	if t.curr_char == `=` {
+		t.switch_state(.before_attr_value)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.attr.name.write_rune(0xfffd)
+		t.switch_state(.attr_name)
+		return
+	}
+
+	if t.curr_char in [`"`, `'`, `<`] {
+		t.parse_error(.unexpected_char_in_attr_name)
+		t.attr.name.write_rune(t.curr_char)
+		t.switch_state(.attr_name)
+		return
+	}
+
+	t.attr.name.write_rune(rune_to_lower(t.curr_char))
+	t.switch_state(.attr_name)
+}
+
+// 13.2.5.34
+fn (mut t Tokenizer) do_state_after_attr_name() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_tag)
+		t.push_eof(
+			name: eof_in_tag_name
+			msg: eof_in_tag_msg
+		)
+		return
+	}
+
+	if t.curr_char in tokenizer.whitespace {
+		t.switch_state(.after_attr_name)
+		return
+	}
+
+	if t.curr_char == `/` {
+		t.switch_state(.self_closing_start_tag)
+		return
+	}
+
+	if t.curr_char == `=` {
+		t.switch_state(.before_attr_value)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	t.attr = Attribute{}
+	t.switch_state(.attr_name, reconsume: true)
+}
+
+// 13.2.5.35
+fn (mut t Tokenizer) do_state_before_attr_value() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.attr_value_unquoted, reconsume: true)
+		return
+	}
+
+	if t.curr_char in tokenizer.whitespace {
+		t.switch_state(.before_attr_value)
+		return
+	}
+
+	if t.curr_char == `"` {
+		t.switch_state(.attr_value_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `'` {
+		t.switch_state(.attr_value_sgl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.missing_attr_value)
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	t.switch_state(.attr_value_unquoted, reconsume: true)
+}
+
+// 13.2.5.36
+fn (mut t Tokenizer) do_state_attr_value_dbl_quoted() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_tag)
+		t.push_eof(
+			name: eof_in_tag_name
+			msg: eof_in_tag_msg
+		)
+		return
+	}
+
+	if t.curr_char == `"` {
+		t.switch_state(.after_attr_value_quoted)
+		return
+	}
+
+	if t.curr_char == `&` {
+		t.switch_state(.char_reference, return_to: .attr_value_dbl_quoted)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.attr.value.write_rune(0xfffd)
+		t.switch_state(.attr_value_dbl_quoted)
+		return
+	}
+
+	t.attr.value.write_rune(t.curr_char)
+	t.switch_state(.attr_value_dbl_quoted)
+}
+
+// 13.2.5.37
+fn (mut t Tokenizer) do_state_attr_value_sgl_quoted() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_tag)
+		t.push_eof(
+			name: eof_in_tag_name
+			msg: eof_in_tag_msg
+		)
+		return
+	}
+
+	if t.curr_char == `'` {
+		t.switch_state(.after_attr_value_quoted)
+		return
+	}
+
+	if t.curr_char == `&` {
+		t.switch_state(.char_reference, return_to: .attr_value_sgl_quoted)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.attr.value.write_rune(0xfffd)
+		t.switch_state(.attr_value_sgl_quoted)
+		return
+	}
+
+	t.attr.value.write_rune(t.curr_char)
+	t.switch_state(.attr_value_sgl_quoted)
+}
+
+// 13.2.5.38
+fn (mut t Tokenizer) do_state_attr_value_unquoted() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_tag)
+		t.push_eof(
+			name: eof_in_tag_name
+			msg: eof_in_tag_msg
+		)
+		return
+	}
+
+	if t.curr_char in tokenizer.whitespace {
+		t.switch_state(.before_attr_name)
+		return
+	}
+
+	if t.curr_char == `&` {
+		t.switch_state(.char_reference, return_to: .attr_value_unquoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		t.attr.value.write_rune(0xfffd)
+		t.switch_state(.attr_value_unquoted)
+		return
+	}
+
+	if t.curr_char in [`"`, `'`, `<`, `=`, `\``] {
+		t.parse_error(.unexpected_char_in_unquoted_attr_value)
+		t.push_char()
+		t.switch_state(.attr_value_unquoted)
+		return
+	}
+
+	t.attr.value.write_rune(t.curr_char)
+	t.switch_state(.attr_value_unquoted)
+}
+
+// 13.2.5.39
+fn (mut t Tokenizer) do_state_after_attr_value_quoted() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_tag)
+		t.push_eof(
+			name: eof_in_tag_name
+			msg: eof_in_tag_msg
+		)
+		return
+	}
+
+	if t.curr_char in tokenizer.whitespace {
+		t.switch_state(.before_attr_name)
+		return
+	}
+
+	if t.curr_char == `/` {
+		t.switch_state(.self_closing_start_tag)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	t.parse_error(.missing_whitespace_between_attr)
+	t.switch_state(.before_attr_name, reconsume: true)
+}
+
+// 13.2.5.40
+fn (mut t Tokenizer) do_state_self_closing_start_tag() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_tag)
+		t.push_eof(
+			name: eof_in_tag_name
+			msg: eof_in_tag_msg
+		)
+	}
+
+	if t.curr_char == `>` {
+		mut tok := t.curr_token as TagToken
+		tok.self_closing = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	t.parse_error(.unexpected_solidus_in_tag)
+	t.switch_state(.before_attr_name, reconsume: true)
+}
+
+// 13.2.5.41
+fn (mut t Tokenizer) do_state_bogus_comment() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_eof(EOFToken{})
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	if _unlikely_(t.curr_char == tokenizer.null) {
+		t.parse_error(.unexpected_null_character)
+		mut tok := t.curr_token as CommentToken
+		tok.data << 0xfffd
+		t.curr_token = tok
+		return
+	}
+
+	mut tok := t.curr_token as CommentToken
+	tok.data << t.curr_char
+	t.curr_token = tok
+}
+
+// 13.2.5.42
+fn (mut t Tokenizer) do_state_markup_declaration_open() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.incorrectly_opened_comment)
+		t.curr_token = CommentToken{}
+		t.switch_state(.bogus_comment, reconsume: true)
+	}
+
+	if t.look_ahead('--') {
+		t.curr_token = CommentToken{}
+		t.switch_state(.comment_start)
+		return
+	}
+
+	if t.look_ahead('DOCTYPE', case_sensitive: false) {
+		t.switch_state(.doctype)
+		return
+	}
+
+	if t.look_ahead('[CDATA[') {
+		// TODO: I'm not sure exactly what I'm suppose to do here.
+		// I've never used CDATA in HTML and never seen it used, so I
+		// assume that means it can be put on the back burner.
+
+		// From the specs page:
+		// "If there is an adjusted current node and it is not an
+		// element in the HTML namespace, then switch to the CDATA section
+		// state. Otherwise, this is a cdata-in-html-content parse error.
+		// Create a comment token whose data is the '[CDATA[' string.
+		// Switch to the bogus comment state."
+		if false {
+			t.switch_state(.cdata_section)
+		} else {
+			t.parse_error(.cdata_in_html_content)
+			t.curr_token = CommentToken{
+				data: '[CDATA['.runes()
+			}
+			t.switch_state(.bogus_comment)
+		}
+		return
+	}
+
+	t.parse_error(.incorrectly_opened_comment)
+	t.curr_token = CommentToken{}
+	t.switch_state(.bogus_comment, reconsume: true)
+}
+
+// 13.2.5.43
+fn (mut t Tokenizer) do_state_comment_start() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.comment, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `-` {
+		t.switch_state(.comment_start_dash)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.abrupt_closing_of_empty_comment)
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	t.switch_state(.comment, reconsume: true)
+}
+
+// 13.2.5.44
+fn (mut t Tokenizer) do_state_comment_start_dash() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_comment)
+		t.push_token(t.curr_token)
+		t.push_eof(
+			name: eof_in_comment_name
+			msg: eof_in_comment_msg
+		)
+		return
+	}
+
+	if t.curr_char == `-` {
+		t.switch_state(.comment)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.abrupt_closing_of_empty_comment)
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	mut tok := t.curr_token as CommentToken
+	tok.data << `-`
+	t.curr_token = tok
+	t.switch_state(.comment, reconsume: true)
+}
+
+// 13.2.5.45
+fn (mut t Tokenizer) do_comment() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_comment)
+		t.push_token(t.curr_token)
+		t.push_eof(
+			name: eof_in_comment_name
+			msg: eof_in_comment_msg
+		)
+		return
+	}
+
+	if t.curr_char == `<` {
+		mut tok := t.curr_token as CommentToken
+		tok.data << t.curr_char
+		t.curr_token = tok
+		t.switch_state(.comment_lt_sign)
+		return
+	}
+
+	if t.curr_char == `-` {
+		t.switch_state(.comment_end_dash)
+		return
+	}
+
+	if _unlikely_(t.curr_char == null) {
+		t.parse_error(.unexpected_null_character)
+		mut tok := t.curr_token as CommentToken
+		tok.data << 0xfffd
+		t.curr_token = tok
+		return
+	}
+
+	mut tok := t.curr_token as CommentToken
+	tok.data << t.curr_char()
+	t.curr_token = tok
+}
+
+// 13.2.5.46
+fn (mut t Tokenizer) do_state_comment_lt_sign() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.comment, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `!` {
+		mut tok := t.curr_token as CommentToken
+		tok.data << t.curr_char
+		t.curr_token = tok
+		t.switch_state(.comment_lt_sign_bang)
+		return
+	}
+
+	if t.curr_char == `<` {
+		mut tok := t.curr_token as CommentToken
+		tok.data << t.curr_char
+		t.curr_char = tok
+		t.switch_state(.comment_lt_sign)
+		return
+	}
+
+	t.switch_state(.comment, reconsume: true)
+}
+
+// 13.2.5.47
+fn (mut t Tokenizer) do_state_comment_lt_sign_bang() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.comment, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `-` {
+		t.switch_state(.comment_lt_sign_bang_dash)
+		return
+	}
+
+	t.switch_state(.comment, reconsume: true)
+}
+
+// 13.2.5.48
+fn (mut t Tokenizer) do_state_comment_lt_sign_bang_dash() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.comment_end_dash, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `-` {
+		t.switch_state(.comment_lt_sign_bang_dash_dash)
+		return
+	}
+
+	t.switch_state(.comment_end_dash, reconsume: true)
+}
+
+// 13.2.5.49
+fn (mut t Tokenizer) do_state_comment_lt_sign_bang_dash_dash() {
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.comment_end, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.switch_state(.comment_end, reconsume: true)
+		return
+	}
+
+	t.parse_error(.nested_comment)
+	t.switch_state(.comment_end)
+}
+
+// 13.2.5.50
+fn (mut t Tokenizer) do_state_comment_end_dash() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_comment)
+		t.push_token(t.curr_token)
+		t.push_eof(
+			name: eof_in_comment_name
+			msg: eof_in_comment_msg
+		)
+		return
+	}
+
+	if t.curr_char == `-` {
+		t.switch_state(.comment_end)
+		return
+	}
+
+	mut tok := t.curr_token as CommentToken
+	tok.data << `-`
+	t.switch_state(.comment, reconsume: true)
+}
+
+// 13.2.5.51
+fn (mut t Tokenizer) do_state_comment_end() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_comment)
+		t.push_token(t.curr_token)
+		t.push_eof(
+			name: eof_in_comment_name
+			msg: eof_in_comment_msg
+		)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	if t.curr_char == `!` {
+		t.switch_state(.comment_end_bang)
+		return
+	}
+	
+	if t.curr_char == `-` {
+		mut tok := t.curr_token as CommentToken
+		tok.data << `-`
+		t.curr_token = tok
+		t.switch_state(.comment_end)
+		return
+	}
+
+	mut tok := t.curr_token as CommentToken
+	tok.data << '--'.runes()
+	t.switch_state(.comment, reconsume: true)
+}
+
+// 13.2.5.52
+fn (mut t Tokenizer) do_state_comment_end_bang() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_comment)
+		t.push_token(t.curr_token)
+		t.push_eof(
+			name: eof_in_comment_name
+			msg: eof_in_comment_msg
+		)
+		return
+	}
+
+	if t.curr_char == `-` {
+		mut tok := t.curr_token as CommentToken
+		tok.data << '--!'.runes()
+		t.curr_token = tok
+		t.switch_state(.comment_end_dash)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.incorrectly_closed_comment)
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	mut tok := t.curr_token as CommentToken
+	tok.data << '--!'.runes()
+	t.switch_state(.comment, reconsume: true)
+}
+
+// 13.2.5.53
+fn (mut t Tokenizer) do_state_doctype() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		t.curr_token = DoctypeToken{force_quirks: true}
+		t.push_token(t.curr_token)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.before_doctype_name)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.switch_state(.before_doctype_name, reconsume: true)
+		return
+	}
+
+	t.parse_error(.missing_whitespace_before_doctype_name)
+	t.switch_state(.before_doctype_name, reconsume: true)
+}
+
+// 13.2.5.54
+fn (mut t Tokenizer) do_state_before_doctype_name() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.missing_doctype_name)
+		t.curr_token = DoctypeToken{force_quirks: true}
+		t.push_token(t.curr_token)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.before_doctype_name)
+		return
+	}
+
+	if _unlikely_(t.curr_char == null) {
+		t.parse_error(.unexpected_null_character)
+		t.curr_token = DoctypeToken{name: rune(0xfffd).str()}
+		t.switch_state(.doctype_name)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.missing_doctype_name)
+		t.curr_token = DoctypeToken{force_quirks: true}
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	t.curr_token = DoctypeToken{name: t.curr_char.str()}
+	t.switch_state(.doctype_name)
 }
