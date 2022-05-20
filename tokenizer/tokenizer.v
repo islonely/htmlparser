@@ -15,6 +15,9 @@ const (
 	ascii_numeric      = '123455678890'.runes()
 	ascii_alpha        = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz'.runes()
 	ascii_alphanumeric = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789'.runes()
+
+	hex_digits = 'abcdefABCDEF0123456789'.runes()
+	dec_digits = '0123456789'.runes()
 )
 
 enum TokenizerState {
@@ -81,11 +84,13 @@ enum TokenizerState {
 	rcdata_lt_sign
 	self_closing_start_tag
 	script_data
+	script_data_double_escaped
 	script_data_double_escape_end
 	script_data_double_escape_start
 	script_data_double_escaped_dash
 	script_data_double_escaped_dash_dash
 	script_data_double_escaped_lt_sign
+	script_data_end_tag_name
 	script_data_end_tag_open
 	script_data_escape_start
 	script_data_escape_start_dash
@@ -108,12 +113,14 @@ mut:
 	cursor    int
 	curr_char rune
 
-	curr_attr  Attribute
+	curr_attr  AttributeBuilder
 	curr_token Token = EOFToken{}
 	open_tags  Stack<TagToken>
 
-	bldr strings.Builder
-pub mut:
+	char_ref_code int
+
+	bldr strings.Builder = strings.new_builder(0)
+
 	input  []rune
 	tokens []Token
 }
@@ -146,14 +153,6 @@ fn (t &Tokenizer) peek_codepoint(offset int) ?rune {
 	return t.input[t.cursor + offset]
 }
 
-// [inline]
-// fn (mut t Tokenizer) propagate(callback fn (mut Tokenizer)) {
-// 	t.curr_char = t.next_codepoint() or {
-// 		callback(mut t)
-// 		return
-// 	}
-// }
-
 [params]
 struct SwitchStateParams {
 	return_to TokenizerState = .@none
@@ -167,6 +166,10 @@ fn (mut t Tokenizer) switch_state(state TokenizerState, params SwitchStateParams
 
 	if params.reconsume {
 		t.cursor--
+	}
+
+	if params.return_to != .@none {
+		t.return_state.push(params.return_to)
 	}
 
 	match t.state {
@@ -232,11 +235,13 @@ fn (mut t Tokenizer) switch_state(state TokenizerState, params SwitchStateParams
 		.rcdata_lt_sign { t.do_state_rcdata_lt_sign() }
 		.self_closing_start_tag { t.do_state_self_closing_start_tag() }
 		.script_data { t.do_state_script_data() }
+		.script_data_double_escaped { t.do_state_script_data_double_escaped() }
 		.script_data_double_escape_end { t.do_state_script_data_double_escape_end() }
 		.script_data_double_escape_start { t.do_state_script_data_double_escape_start() }
 		.script_data_double_escaped_dash { t.do_state_script_data_double_escaped_dash() }
 		.script_data_double_escaped_dash_dash { t.do_state_script_data_double_escaped_dash_dash() }
 		.script_data_double_escaped_lt_sign { t.do_state_script_data_double_escaped_lt_sign() }
+		.script_data_end_tag_name { t.do_state_script_data_end_tag_name() }
 		.script_data_end_tag_open { t.do_state_script_data_end_tag_open() }
 		.script_data_escape_start { t.do_state_script_data_escape_start() }
 		.script_data_escape_start_dash { t.do_state_script_data_escape_start_dash() }
@@ -250,10 +255,6 @@ fn (mut t Tokenizer) switch_state(state TokenizerState, params SwitchStateParams
 		.tag_name { t.do_state_tag_name() }
 		.tag_open { t.do_state_tag_open() }
 		else { exit_state_not_implemented(t.state) }
-	}
-
-	if params.return_to != .@none {
-		t.switch_state(params.return_to)
 	}
 }
 
@@ -313,11 +314,28 @@ fn (mut t Tokenizer) push_eof(tok EOFToken) {
 	t.push_token(tok)
 }
 
-pub fn (mut t Tokenizer) run(html []rune) {
+fn (mut t Tokenizer) flush_codepoints() {
+	if state := t.return_state.peek() {
+		if state in [
+			.attr_value_dbl_quoted,
+			.attr_value_sgl_quoted,
+			.attr_value_unquoted
+		] {
+			t.curr_attr.value.write_string(t.bldr.str())
+		} else {
+			t.push_string(t.bldr.str())
+		}
+	} else {
+		t.push_string(t.bldr.str())
+	}
+}
+
+pub fn (mut t Tokenizer) run(html []rune) []Token {
 	t.input = html
 	for t.state != .eof {
 		t.switch_state(.data)
 	}
+	return t.tokens
 }
 
 [inline]
@@ -327,6 +345,15 @@ fn (t &Tokenizer) do_state_eof() {
 
 fn (t &Tokenizer) parse_error(typ ParseError) {
 	println('Parse Error: $typ')
+}
+
+fn (mut t Tokenizer) do_return_state(reconsume bool) {
+	if state := t.return_state.pop() {
+		t.switch_state(state, reconsume: reconsume)
+	} else {
+		println('Parse Error: No return state set. This should never happen. Switching to data state.')
+		t.switch_state(.data, reconsume: reconsume)
+	}
 }
 
 // functions for each state organized how they appear here
@@ -349,9 +376,9 @@ fn (mut t Tokenizer) do_state_data() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
-		t.push_char()
+		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.data)
 		return
 	}
@@ -376,7 +403,7 @@ fn (mut t Tokenizer) do_state_rcdata() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.rcdata)
@@ -393,7 +420,7 @@ fn (mut t Tokenizer) do_state_rawtext() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.rawtext)
@@ -415,7 +442,7 @@ fn (mut t Tokenizer) do_state_script_data() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.script_data)
@@ -432,7 +459,7 @@ fn (mut t Tokenizer) do_state_plaintext() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.plaintext)
@@ -446,7 +473,7 @@ fn (mut t Tokenizer) do_state_plaintext() {
 fn (mut t Tokenizer) do_state_tag_open() {
 	t.curr_char = t.next_codepoint() or {
 		t.parse_error(.eof_before_tag_name)
-		t.push_char()
+		t.push_rune(`<`)
 		t.push_eof(
 			name: eof_before_tag_name_name
 			msg: eof_before_tag_name_msg
@@ -485,7 +512,7 @@ fn (mut t Tokenizer) do_state_tag_open() {
 fn (mut t Tokenizer) do_state_end_tag_open() {
 	t.curr_char = t.next_codepoint() or {
 		t.parse_error(.eof_before_tag_name)
-		t.push_char()
+		t.push_string('</')
 		t.push_eof(
 			name: eof_before_tag_name_name
 			msg: eof_before_tag_name_msg
@@ -495,13 +522,13 @@ fn (mut t Tokenizer) do_state_end_tag_open() {
 
 	if t.curr_char in tokenizer.ascii_alpha {
 		t.curr_token = TagToken{
-			typ: .end_tag
+			is_start_tag: false
 		}
 		t.switch_state(.tag_name, reconsume: true)
 		return
 	}
 
-	if _unlikely_(t.curr_char == `>`) {
+	if t.curr_char == `>` {
 		t.parse_error(.missing_end_tag_name)
 		t.switch_state(.data)
 		return
@@ -535,16 +562,18 @@ fn (mut t Tokenizer) do_state_tag_name() {
 
 	if t.curr_char == `>` {
 		t.push_token(t.curr_token)
-		if (t.curr_token as TagToken).typ == .start_tag {
-			t.open_tags.push(t.curr_token)
+		if (t.curr_token as TagToken).is_start_tag {
+			t.open_tags.push(t.curr_token as TagToken)
 		}
 		t.switch_state(.data)
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
-		t.push_token(tokenizer.replacement_token)
+		mut tok := t.curr_token as TagToken
+		tok.name += rune(0xfffd).str()
+		t.curr_token = tok
 		t.switch_state(.tag_name)
 		return
 	}
@@ -552,6 +581,7 @@ fn (mut t Tokenizer) do_state_tag_name() {
 	mut tok := t.curr_token as TagToken
 	tok.name += rune_to_lower(t.curr_char).str()
 	t.curr_token = tok
+	t.switch_state(.tag_name)
 }
 
 // 13.2.5.9
@@ -582,7 +612,7 @@ fn (mut t Tokenizer) do_state_rcdata_end_tag_open() {
 
 	if t.curr_char in tokenizer.ascii_alpha {
 		t.curr_token = TagToken{
-			typ: .end_tag
+			is_start_tag: false
 		}
 		t.switch_state(.rcdata_end_tag_name, reconsume: true)
 	}
@@ -652,7 +682,7 @@ fn (mut t Tokenizer) do_state_rcdata_end_tag_name() {
 // 13.2.5.12
 fn (mut t Tokenizer) do_state_rawtext_lt_sign() {
 	t.curr_char = t.next_codepoint() or {
-		t.write_rune(`<`)
+		t.push_rune(`<`)
 		t.switch_state(.rawtext, reconsume: true)
 		return
 	}
@@ -663,7 +693,7 @@ fn (mut t Tokenizer) do_state_rawtext_lt_sign() {
 		return
 	}
 
-	t.write_rune(`<`)
+	t.push_rune(`<`)
 	t.switch_state(.rawtext, reconsume: true)
 	return
 }
@@ -678,7 +708,7 @@ fn (mut t Tokenizer) do_state_rawtext_end_tag_open() {
 
 	if t.curr_char in tokenizer.ascii_alpha {
 		t.curr_token = TagToken{
-			typ: .end_tag
+			is_start_tag: false
 		}
 		t.switch_state(.rawtext_end_tag_name, reconsume: true)
 		return
@@ -779,7 +809,7 @@ fn (mut t Tokenizer) do_state_script_data_end_tag_open() {
 
 	if t.curr_char in tokenizer.ascii_alpha {
 		t.curr_token = TagToken{
-			typ: .end_tag
+			is_start_tag: false
 		}
 		t.switch_state(.script_data_end_tag_name, reconsume: true)
 		return
@@ -870,7 +900,7 @@ fn (mut t Tokenizer) do_state_script_data_escape_start_dash() {
 
 	if t.curr_char == `-` {
 		t.push_rune(`-`)
-		t.switch_state(.script_data_escape_start_dash_dash)
+		t.switch_state(.script_data_escaped_dash_dash)
 		return
 	}
 
@@ -899,7 +929,7 @@ fn (mut t Tokenizer) do_state_script_data_escaped() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.script_data_escaped)
@@ -932,7 +962,7 @@ fn (mut t Tokenizer) do_state_script_data_escaped_dash() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.script_data_escaped)
@@ -971,7 +1001,7 @@ fn (mut t Tokenizer) do_state_script_data_escaped_dash_dash() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.script_data)
@@ -983,7 +1013,7 @@ fn (mut t Tokenizer) do_state_script_data_escaped_dash_dash() {
 }
 
 // 13.2.5.23
-fn (mut t Tokenizer) do_state_escaped_lt_sign() {
+fn (mut t Tokenizer) do_state_script_data_escaped_lt_sign() {
 	t.curr_char = t.next_codepoint() or {
 		t.push_rune(`<`)
 		t.switch_state(.script_data_escaped, reconsume: true)
@@ -1008,7 +1038,7 @@ fn (mut t Tokenizer) do_state_escaped_lt_sign() {
 }
 
 // 13.2.5.24
-fn (mut t Tokenizer) do_state_escaped_end_tag_open() {
+fn (mut t Tokenizer) do_state_script_data_escaped_end_tag_open() {
 	t.curr_char = t.next_codepoint() or {
 		t.push_string('</')
 		t.switch_state(.script_data_escaped, reconsume: true)
@@ -1017,7 +1047,7 @@ fn (mut t Tokenizer) do_state_escaped_end_tag_open() {
 
 	if t.curr_char in tokenizer.ascii_alpha {
 		t.curr_token = TagToken{
-			typ: .end_tag
+			is_start_tag: false
 		}
 		t.switch_state(.script_data_escaped_end_tag_name, reconsume: true)
 		return
@@ -1088,7 +1118,7 @@ fn (mut t Tokenizer) do_state_script_data_escaped_end_tag_name() {
 // 13.2.5.26
 fn (mut t Tokenizer) do_state_script_data_double_escape_start() {
 	t.curr_char = t.next_codepoint() or {
-		t.switch_state(.script_escaped, reconsume: true)
+		t.switch_state(.script_data_escaped, reconsume: true)
 		return
 	}
 
@@ -1141,7 +1171,7 @@ fn (mut t Tokenizer) do_state_script_data_double_escaped() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		return
@@ -1174,7 +1204,7 @@ fn (mut t Tokenizer) do_state_script_data_double_escaped_dash() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.script_data_double_escaped)
@@ -1213,7 +1243,7 @@ fn (mut t Tokenizer) do_state_script_data_double_escaped_dash_dash() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.push_token(tokenizer.replacement_token)
 		t.switch_state(.script_data_double_escaped)
@@ -1279,7 +1309,7 @@ fn (mut t Tokenizer) do_state_before_attr_name() {
 	}
 
 	if t.curr_char in tokenizer.whitespace {
-		t.switch_state(.do_state_before_attr_name)
+		t.switch_state(.before_attr_name)
 		return
 	}
 
@@ -1290,27 +1320,25 @@ fn (mut t Tokenizer) do_state_before_attr_name() {
 
 	if t.curr_char == `=` {
 		t.parse_error(.unexpected_equals_sign_before_attr_name)
+		t.curr_attr = AttributeBuilder{}
 		t.curr_attr.name.write_rune(t.curr_char)
 		t.switch_state(.attr_name)
 		return
 	}
 
-	t.curr_attr = Attribute{}
+	t.curr_attr = AttributeBuilder{}
 	t.switch_state(.attr_name, reconsume: true)
 }
 
 // 13.2.5.33
 fn (mut t Tokenizer) do_state_attr_name() {
 	t.curr_char = t.next_codepoint() or {
-		if _unlikely_(t.attr.name.str() in (t.curr_token as TagToken).attr) {
-			t.parse_error(.deplicate_attr)
-		}
 		t.switch_state(.after_attr_name, reconsume: true)
 		return
 	}
 
-	if t.curr_char in tokenizer.whitespace {
-		t.switch_state(.after_attr_name)
+	if t.curr_char in tokenizer.whitespace || t.curr_char == `/` || t.curr_char == `>` {
+		t.switch_state(.after_attr_name, reconsume: true)
 		return
 	}
 
@@ -1319,21 +1347,18 @@ fn (mut t Tokenizer) do_state_attr_name() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
-		t.attr.name.write_rune(0xfffd)
+		t.curr_attr.name.write_rune(0xfffd)
 		t.switch_state(.attr_name)
 		return
 	}
 
 	if t.curr_char in [`"`, `'`, `<`] {
 		t.parse_error(.unexpected_char_in_attr_name)
-		t.attr.name.write_rune(t.curr_char)
-		t.switch_state(.attr_name)
-		return
 	}
 
-	t.attr.name.write_rune(rune_to_lower(t.curr_char))
+	t.curr_attr.name.write_rune(rune_to_lower(t.curr_char))
 	t.switch_state(.attr_name)
 }
 
@@ -1369,7 +1394,7 @@ fn (mut t Tokenizer) do_state_after_attr_name() {
 		return
 	}
 
-	t.attr = Attribute{}
+	t.curr_attr = AttributeBuilder{}
 	t.switch_state(.attr_name, reconsume: true)
 }
 
@@ -1426,14 +1451,14 @@ fn (mut t Tokenizer) do_state_attr_value_dbl_quoted() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
-		t.attr.value.write_rune(0xfffd)
+		t.curr_attr.value.write_rune(0xfffd)
 		t.switch_state(.attr_value_dbl_quoted)
 		return
 	}
 
-	t.attr.value.write_rune(t.curr_char)
+	t.curr_attr.value.write_rune(t.curr_char)
 	t.switch_state(.attr_value_dbl_quoted)
 }
 
@@ -1458,19 +1483,26 @@ fn (mut t Tokenizer) do_state_attr_value_sgl_quoted() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
-		t.attr.value.write_rune(0xfffd)
+		t.curr_attr.value.write_rune(0xfffd)
 		t.switch_state(.attr_value_sgl_quoted)
 		return
 	}
 
-	t.attr.value.write_rune(t.curr_char)
+	t.curr_attr.value.write_rune(t.curr_char)
 	t.switch_state(.attr_value_sgl_quoted)
 }
 
 // 13.2.5.38
 fn (mut t Tokenizer) do_state_attr_value_unquoted() {
+	mut tok := t.curr_token as TagToken
+	tok.attr << Attribute{
+		name: t.curr_attr.name.str()
+		value: t.curr_attr.value.str()
+	}
+	t.curr_token = tok
+
 	t.curr_char = t.next_codepoint() or {
 		t.parse_error(.eof_in_tag)
 		t.push_eof(
@@ -1496,26 +1528,34 @@ fn (mut t Tokenizer) do_state_attr_value_unquoted() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
-		t.attr.value.write_rune(0xfffd)
+		t.curr_attr.value.write_rune(0xfffd)
 		t.switch_state(.attr_value_unquoted)
 		return
 	}
 
 	if t.curr_char in [`"`, `'`, `<`, `=`, `\``] {
 		t.parse_error(.unexpected_char_in_unquoted_attr_value)
-		t.push_char()
+		// t.push_char()
+		t.curr_attr.value.write_rune(t.curr_char)
 		t.switch_state(.attr_value_unquoted)
 		return
 	}
 
-	t.attr.value.write_rune(t.curr_char)
+	t.curr_attr.value.write_rune(t.curr_char)
 	t.switch_state(.attr_value_unquoted)
 }
 
 // 13.2.5.39
 fn (mut t Tokenizer) do_state_after_attr_value_quoted() {
+	mut tok := t.curr_token as TagToken
+	tok.attr << Attribute{
+		name: t.curr_attr.name.str()
+		value: t.curr_attr.value.str()
+	}
+	t.curr_token = tok
+
 	t.curr_char = t.next_codepoint() or {
 		t.parse_error(.eof_in_tag)
 		t.push_eof(
@@ -1553,6 +1593,7 @@ fn (mut t Tokenizer) do_state_self_closing_start_tag() {
 			name: eof_in_tag_name
 			msg: eof_in_tag_msg
 		)
+		return
 	}
 
 	if t.curr_char == `>` {
@@ -1580,7 +1621,7 @@ fn (mut t Tokenizer) do_state_bogus_comment() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == tokenizer.null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		mut tok := t.curr_token as CommentToken
 		tok.data << 0xfffd
@@ -1595,24 +1636,25 @@ fn (mut t Tokenizer) do_state_bogus_comment() {
 
 // 13.2.5.42
 fn (mut t Tokenizer) do_state_markup_declaration_open() {
-	t.curr_char = t.next_codepoint() or {
-		t.parse_error(.incorrectly_opened_comment)
-		t.curr_token = CommentToken{}
-		t.switch_state(.bogus_comment, reconsume: true)
-	}
+	// t.curr_char = t.next_codepoint() or {
+	// 	t.parse_error(.incorrectly_opened_comment)
+	// 	t.curr_token = CommentToken{}
+	// 	t.switch_state(.bogus_comment, reconsume: true)
+	// 	return
+	// }
 
-	if t.look_ahead('--') {
+	if _ := t.look_ahead('--') {
 		t.curr_token = CommentToken{}
 		t.switch_state(.comment_start)
 		return
 	}
 
-	if t.look_ahead('DOCTYPE', case_sensitive: false) {
+	if _ := t.look_ahead('DOCTYPE', case_sensitive: false) {
 		t.switch_state(.doctype)
 		return
 	}
 
-	if t.look_ahead('[CDATA[') {
+	if _ := t.look_ahead('[CDATA[') {
 		// TODO: I'm not sure exactly what I'm suppose to do here.
 		// I've never used CDATA in HTML and never seen it used, so I
 		// assume that means it can be put on the back burner.
@@ -1693,7 +1735,7 @@ fn (mut t Tokenizer) do_state_comment_start_dash() {
 }
 
 // 13.2.5.45
-fn (mut t Tokenizer) do_comment() {
+fn (mut t Tokenizer) do_state_comment() {
 	t.curr_char = t.next_codepoint() or {
 		t.parse_error(.eof_in_comment)
 		t.push_token(t.curr_token)
@@ -1717,7 +1759,7 @@ fn (mut t Tokenizer) do_comment() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		mut tok := t.curr_token as CommentToken
 		tok.data << 0xfffd
@@ -1726,7 +1768,7 @@ fn (mut t Tokenizer) do_comment() {
 	}
 
 	mut tok := t.curr_token as CommentToken
-	tok.data << t.curr_char()
+	tok.data << t.curr_char
 	t.curr_token = tok
 }
 
@@ -1748,7 +1790,7 @@ fn (mut t Tokenizer) do_state_comment_lt_sign() {
 	if t.curr_char == `<` {
 		mut tok := t.curr_token as CommentToken
 		tok.data << t.curr_char
-		t.curr_char = tok
+		t.curr_token = tok
 		t.switch_state(.comment_lt_sign)
 		return
 	}
@@ -1937,7 +1979,7 @@ fn (mut t Tokenizer) do_state_before_doctype_name() {
 		return
 	}
 
-	if _unlikely_(t.curr_char == null) {
+	if t.curr_char == tokenizer.null {
 		t.parse_error(.unexpected_null_character)
 		t.curr_token = DoctypeToken{name: rune(0xfffd).str()}
 		t.switch_state(.doctype_name)
@@ -1954,4 +1996,965 @@ fn (mut t Tokenizer) do_state_before_doctype_name() {
 
 	t.curr_token = DoctypeToken{name: t.curr_char.str()}
 	t.switch_state(.doctype_name)
+}
+
+// 13.2.5.55
+fn (mut t Tokenizer) do_state_doctype_name() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.unexpected_null_character)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.after_doctype_name)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	if t.curr_char == tokenizer.null {
+		t.parse_error(.unexpected_null_character)
+		mut tok := t.curr_token as DoctypeToken
+		tok.name += rune(0xfffd).str()
+		t.curr_token = tok
+		t.switch_state(.doctype_name)
+		return
+	}
+
+	mut tok := t.curr_token as DoctypeToken
+	tok.name += t.curr_char.str()
+	t.curr_token = tok
+	t.switch_state(.doctype_name)
+}
+
+// 13.2.5.56
+fn (mut t Tokenizer) do_state_after_doctype_name() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.after_doctype_name)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	if _ := t.look_ahead('PUBLIC', case_sensitive: false) {
+		t.switch_state(.after_doctype_public_keyword)
+		return
+	}
+
+	if _ := t.look_ahead('SYSTEM', case_sensitive: false) {
+		t.switch_state(.after_doctype_system_keyword)
+		return
+	}
+
+	t.parse_error(.invalid_char_sequence_after_doctype_name)
+	mut tok := t.curr_token as DoctypeToken
+	tok.force_quirks = true
+	t.switch_state(.bogus_doctype, reconsume: true)
+}
+
+// 13.2.5.57
+fn (mut t Tokenizer) do_state_after_doctype_public_keyword() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.before_doctype_public_identifier)
+		return
+	}
+
+	if t.curr_char == `"` {
+		t.parse_error(.missing_whitespace_after_doctype_public_keyword)
+		mut tok := t.curr_token as DoctypeToken
+		tok.public_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_public_identifier_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `'` {
+		t.parse_error(.missing_whitespace_after_doctype_public_keyword)
+		mut tok := t.curr_token as DoctypeToken
+		tok.public_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_public_identifier_sgl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.missing_doctype_public_identifier)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	t.parse_error(.missing_quote_before_doctype_public_identifier)
+	mut tok := t.curr_token as DoctypeToken
+	tok.force_quirks = true
+	t.curr_token = tok
+	t.switch_state(.bogus_doctype, reconsume: true)
+}
+
+// 13.2.5.58
+fn (mut t Tokenizer) do_state_before_doctype_public_identifier() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(t.curr_token)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.before_doctype_public_identifier)
+		return
+	}
+
+	if t.curr_char == `"` {
+		mut tok := t.curr_token as DoctypeToken
+		tok.public_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_public_identifier_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `'` {
+		mut tok := t.curr_token as DoctypeToken
+		tok.public_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_public_identifier_sgl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.missing_doctype_public_identifier)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	t.parse_error(.missing_quote_before_doctype_public_identifier)
+	mut tok := t.curr_token as DoctypeToken
+	tok.force_quirks = true
+	t.curr_token = tok
+	t.switch_state(.bogus_doctype, reconsume: true)
+}
+
+// 13.2.5.59
+fn (mut t Tokenizer) do_state_doctype_public_identifier_dbl_quoted() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		t.switch_state(.data)
+		return
+	}
+
+	if t.curr_char == `"` {
+		t.switch_state(.after_doctype_public_identifier)
+		return
+	}
+
+	if t.curr_char == null {
+		t.parse_error(.unexpected_null_character)
+		mut tok := t.curr_token as DoctypeToken
+		tok.public_id += rune(0xfffd).str()
+		t.curr_token = tok
+		t.switch_state(.doctype_public_identifier_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.abrupt_doctype_public_identifier)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	mut tok := t.curr_token as DoctypeToken
+	tok.public_id += t.curr_char.str()
+	t.curr_token = tok
+	t.switch_state(.doctype_public_identifier_dbl_quoted)
+}
+
+// 13.2.5.60
+fn (mut t Tokenizer) do_state_doctype_public_identifier_sgl_quoted() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		t.switch_state(.data)
+		return
+	}
+
+	if t.curr_char == `'` {
+		t.switch_state(.after_doctype_public_identifier)
+		return
+	}
+
+	if t.curr_char == null {
+		t.parse_error(.unexpected_null_character)
+		mut tok := t.curr_token as DoctypeToken
+		tok.public_id += rune(0xfffd).str()
+		t.curr_token = tok
+		t.switch_state(.doctype_public_identifier_sgl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.abrupt_doctype_public_identifier)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	mut tok := t.curr_token as DoctypeToken
+	tok.public_id += t.curr_char.str()
+	t.curr_token = tok
+	t.switch_state(.doctype_public_identifier_sgl_quoted)
+}
+
+// 13.2.5.61
+fn (mut t Tokenizer) do_state_after_doctype_public_identifier() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_name
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.between_doctype_public_and_system_identifiers)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	if t.curr_char == `"` {
+		t.parse_error(.missing_whitespace_between_doctype_public_and_system_identifiers)
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id = ''
+		t.switch_state(.doctype_system_identifier_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `'` {
+		t.parse_error(.missing_whitespace_between_doctype_public_and_system_identifiers)
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id = ''
+		t.switch_state(.doctype_system_identifier_sgl_quoted)
+		return
+	}
+
+	t.parse_error(.missing_quote_before_doctype_system_identifier)
+	mut tok := t.curr_token as DoctypeToken
+	tok.force_quirks = true
+	t.switch_state(.bogus_doctype, reconsume: true)
+}
+
+// 13.2.5.62
+fn (mut t Tokenizer) do_state_between_doctype_public_and_system_identifiers() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.between_doctype_public_and_system_identifiers)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	if t.curr_char == `"` {
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_system_identifier_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `'` {
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_system_identifier_sgl_quoted)
+		return
+	}
+
+	t.parse_error(.missing_quote_before_doctype_system_identifier)
+	mut tok := t.curr_token as DoctypeToken
+	tok.force_quirks = true
+	t.curr_token = tok
+	t.switch_state(.bogus_doctype, reconsume: true)
+}
+
+// 13.2.5.63
+fn (mut t Tokenizer) do_state_after_doctype_system_keyword() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.before_doctype_system_identifier)
+		return
+	}
+
+	if t.curr_char == `"` {
+		t.parse_error(.missing_whitespace_after_doctype_system_keyword)
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_system_identifier_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `'` {
+		t.parse_error(.missing_whitespace_after_doctype_system_keyword)
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_system_identifier_sgl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.missing_doctype_system_identifier)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	t.parse_error(.missing_quote_before_doctype_system_identifier)
+	mut tok := t.curr_token as DoctypeToken
+	tok.force_quirks = true
+	t.curr_token = tok
+	t.switch_state(.bogus_doctype, reconsume: true)
+}
+
+// 13.2.5.64
+fn (mut t Tokenizer) do_state_before_doctype_system_identifier() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.before_doctype_system_identifier)
+		return
+	}
+
+	if t.curr_char == `"` {
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_system_identifier_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `'` {
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id = ''
+		t.curr_token = tok
+		t.switch_state(.doctype_system_identifier_sgl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.missing_doctype_system_identifier)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	t.parse_error(.missing_quote_before_doctype_system_identifier)
+	mut tok := t.curr_token as DoctypeToken
+	tok.force_quirks = true
+	t.curr_token = tok
+	t.switch_state(.bogus_doctype, reconsume: true)
+}
+
+// 13.2.5.65
+fn (mut t Tokenizer) do_state_doctype_system_identifier_dbl_quoted() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char == `"` {
+		t.switch_state(.after_doctype_system_identifier)
+		return
+	}
+
+	if t.curr_char == null {
+		t.parse_error(.unexpected_null_character)
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id += rune(0xfffd).str()
+		t.curr_token = tok
+		t.switch_state(.doctype_system_identifier_dbl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.abrupt_doctype_system_identifier)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	mut tok := t.curr_token as DoctypeToken
+	tok.system_id += t.curr_char.str()
+	t.curr_token = tok
+	t.switch_state(.doctype_system_identifier_dbl_quoted)
+}
+
+// 13.2.5.66
+fn (mut t Tokenizer) do_state_doctype_system_identifier_sgl_quoted() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char == `'` {
+		t.switch_state(.after_doctype_system_identifier)
+		return
+	}
+
+	if t.curr_char == null {
+		t.parse_error(.unexpected_null_character)
+		mut tok := t.curr_token as DoctypeToken
+		tok.system_id += rune(0xfffd).str()
+		t.curr_token = tok
+		t.switch_state(.doctype_system_identifier_sgl_quoted)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.parse_error(.abrupt_doctype_system_identifier)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.switch_state(.data)
+		return
+	}
+
+	mut tok := t.curr_token as DoctypeToken
+	tok.system_id += t.curr_char.str()
+	t.curr_token = tok
+	t.switch_state(.doctype_system_identifier_sgl_quoted)
+}
+
+// 13.2.5.67
+fn (mut t Tokenizer) do_state_after_doctype_system_identifier() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_doctype)
+		mut tok := t.curr_token as DoctypeToken
+		tok.force_quirks = true
+		t.push_token(tok)
+		t.push_eof(
+			name: eof_in_doctype_name
+			msg: eof_in_doctype_msg
+		)
+		return
+	}
+
+	if t.curr_char in whitespace {
+		t.switch_state(.after_doctype_system_identifier)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.switch_state(.data)
+		return
+	}
+
+	t.parse_error(.unexpected_char_after_doctype_system_identifier)
+	t.switch_state(.bogus_doctype, reconsume: true)
+}
+
+// 13.2.5.68
+fn (mut t Tokenizer) do_state_bogus_doctype() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_token(t.curr_token)
+		t.push_eof(EOFToken{})
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.push_token(t.curr_token)
+		t.push_eof(EOFToken{})
+		return
+	}
+
+	if t.curr_char == null {
+		t.parse_error(.unexpected_null_character)
+		t.switch_state(.bogus_doctype)
+		return
+	}
+
+	t.switch_state(.bogus_doctype)
+}
+
+// 13.2.5.69
+fn (mut t Tokenizer) do_state_cdata_section() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.eof_in_cdata)
+		t.push_eof(
+			name: eof_in_cdata_name
+			msg: eof_in_cdata_msg
+		)
+		return
+	}
+
+	if t.curr_char == `]` {
+		t.switch_state(.cdata_section_bracket)
+		return
+	}
+
+	t.push_char()
+	t.switch_state(.cdata_section)
+}
+
+// 13.2.5.70
+fn (mut t Tokenizer) do_state_cdata_section_bracket() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_rune(`]`)
+		t.switch_state(.cdata_section, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `]` {
+		t.switch_state(.cdata_section_end)
+		return
+	}
+
+	t.push_rune(`]`)
+	t.switch_state(.cdata_section, reconsume: true)
+}
+
+// 13.2.5.71
+fn (mut t Tokenizer) do_state_cdata_section_end() {
+	t.curr_char = t.next_codepoint() or {
+		t.push_string(']]')
+		t.switch_state(.cdata_section)
+		return
+	}
+
+	if t.curr_char == `]` {
+		t.push_rune(`]`)
+		t.switch_state(.cdata_section_end)
+		return
+	}
+
+	if t.curr_char == `>` {
+		t.switch_state(.data)
+		return
+	}
+
+	t.push_string(']]')
+	t.switch_state(.cdata_section, reconsume: true)
+}
+
+// 13.2.5.72
+fn (mut t Tokenizer) do_state_char_reference() {
+	t.bldr = strings.new_builder(0)
+	t.bldr.write_rune(`&`)
+
+	t.curr_char = t.next_codepoint() or {
+		t.flush_codepoints()
+		t.do_return_state(true)
+		return
+	}
+
+	if t.curr_char in ascii_alphanumeric {
+		t.switch_state(.named_char_reference, reconsume: true)
+		return
+	}
+
+	if t.curr_char == `#` {
+		t.bldr.write_rune(t.curr_char)
+		t.switch_state(.num_char_reference)
+		return
+	}
+
+	t.flush_codepoints()
+	t.do_return_state(true)
+}
+
+// 13.2.5.73
+// NOTE: I'm having trouble understanding exactly what this state
+// is does, so something may be implemented incorrectly here. I
+// tried my best though. Here's where it's referenced in the HTML
+// spec though: https://html.spec.whatwg.org/multipage/parsing.html#hexadecimal-character-reference-state:character-reference-code
+fn (mut t Tokenizer) do_state_named_char_reference() {
+	mut ref := ''
+	for {
+		t.curr_char = t.next_codepoint() or {
+			break
+		}
+
+		if t.curr_char == `;` {
+			ref += ';'
+			t.bldr.write_rune(`;`)
+			break
+		}
+
+		if ref in char_ref.keys() {
+			t.cursor--
+			break
+		}
+
+		if t.curr_char !in ascii_alphanumeric {
+			t.cursor--
+			break
+		}
+
+		ref += t.curr_char.str()
+		t.bldr.write_rune(t.curr_char)
+	}
+	last := ref.runes().last()
+
+	if ref in char_ref.keys() {
+		state := t.return_state.peek() or {
+			println('Parse Error: Return state should always be set while parsing a character reference. Treating absence as ambiguous ampersand.')
+			t.flush_codepoints()
+			t.switch_state(.ambiguous_ampersand)
+			return
+		}
+
+		next_char := t.peek_codepoint(1) or { null }
+
+		if state in [
+					.attr_value_dbl_quoted,
+					.attr_value_sgl_quoted,
+					.attr_value_unquoted
+				]
+				&& last != `;`
+				&& (next_char in ascii_alphanumeric || next_char == `=`) {
+			t.flush_codepoints()
+			t.do_return_state(false)
+		} else {
+			if last != `;` {
+				t.parse_error(.missing_semicolon_after_char_reference)
+			}
+
+			t.bldr = strings.new_builder(2)
+			t.bldr.write_string(char_ref[ref].string())
+			// println(t.bldr.str())
+			t.flush_codepoints()
+			t.do_return_state(false)
+		}
+	} else {
+		t.flush_codepoints()
+		t.switch_state(.ambiguous_ampersand)
+	}
+}
+
+// 13.2.5.74
+fn (mut t Tokenizer) do_state_ambiguous_ampersand() {
+	t.curr_char = t.next_codepoint() or {
+		t.do_return_state(true)
+		return
+	}
+
+	if t.curr_char in ascii_alphanumeric {
+		state := t.return_state.peek() or { TokenizerState.@none }
+		if state in [
+			.attr_value_dbl_quoted,
+			.attr_value_sgl_quoted,
+			.attr_value_unquoted
+		] {
+			t.curr_attr.value.write_rune(t.curr_char)
+		} else {
+			t.push_rune(t.curr_char)
+		}
+		t.switch_state(.ambiguous_ampersand)
+		return
+	}
+
+	if t.curr_char == `;` {
+		t.parse_error(.unknown_named_char_reference)
+		t.do_return_state(true)
+		return
+	}
+
+	t.do_return_state(true)
+}
+
+// 13.2.5.75
+fn (mut t Tokenizer) do_state_num_char_reference() {
+	t.char_ref_code = 0
+	t.curr_char = t.next_codepoint() or {
+		t.switch_state(.decimal_char_reference_start, reconsume: true)
+		return
+	}
+
+	if t.curr_char in [`x`, `X`] {
+		t.bldr.write_rune(t.curr_char)
+		t.switch_state(.hex_char_reference_start)
+		return
+	}
+
+	t.switch_state(.decimal_char_reference_start, reconsume: true)
+}
+
+// 13.2.5.76
+fn (mut t Tokenizer) do_state_hex_char_reference_start() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.absence_of_digits_in_num_char_reference)
+		t.flush_codepoints()
+		t.do_return_state(true)
+		return
+	}
+
+	if t.curr_char in hex_digits {
+		t.switch_state(.hex_char_reference, reconsume: true)
+		return
+	}
+
+	t.parse_error(.absence_of_digits_in_num_char_reference)
+	t.flush_codepoints()
+	t.do_return_state(true)
+}
+
+// 13.2.5.77
+fn (mut t Tokenizer) do_state_decimal_char_reference_start() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.absence_of_digits_in_num_char_reference)
+		t.flush_codepoints()
+		t.do_return_state(true)
+		return
+	}
+
+	if t.curr_char in dec_digits {
+		t.switch_state(.decimal_char_reference, reconsume: true)
+		return
+	}
+
+	t.parse_error(.absence_of_digits_in_num_char_reference)
+	t.flush_codepoints()
+	t.do_return_state(true)
+}
+
+// 13.2.5.78
+fn (mut t Tokenizer) do_state_hex_char_reference() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.missing_semicolon_after_char_reference)
+		t.switch_state(.num_char_reference_end, reconsume: true)
+		return
+	}
+
+	if t.curr_char in dec_digits {
+		t.char_ref_code *= 16
+		t.char_ref_code += int(t.curr_char - 0x0030)
+		t.switch_state(.hex_char_reference)
+		return
+	}
+
+	if t.curr_char in 'ABCDEF'.runes() {
+		t.char_ref_code *= 16
+		t.char_ref_code += int(t.curr_char - 0x0037)
+		t.switch_state(.hex_char_reference)
+		return
+	}
+
+	if t.curr_char in 'abcdef'.runes() {
+		t.char_ref_code *= 16
+		t.char_ref_code += int(t.curr_char - 0x0057)
+		t.switch_state(.hex_char_reference)
+		return
+	}
+
+	if t.curr_char == `;` {
+		t.switch_state(.num_char_reference_end)
+	}
+
+	t.parse_error(.missing_semicolon_after_char_reference)
+	t.switch_state(.num_char_reference_end, reconsume: true)
+}
+
+// 13.2.5.79
+fn (mut t Tokenizer) do_state_decimal_char_reference() {
+	t.curr_char = t.next_codepoint() or {
+		t.parse_error(.missing_semicolon_after_char_reference)
+		t.switch_state(.num_char_reference_end, reconsume: true)
+		return
+	}
+
+	if t.curr_char in dec_digits {
+		t.char_ref_code *= 16
+		t.char_ref_code += int(t.curr_char - 0x0030)
+		t.switch_state(.decimal_char_reference)
+		return
+	}
+
+	if t.curr_char == `;` {
+		t.switch_state(.num_char_reference_end)
+		return
+	}
+
+	t.parse_error(.missing_semicolon_after_char_reference)
+	t.switch_state(.num_char_reference_end, reconsume: true)
+}
+
+// 13.2.5.80
+fn (mut t Tokenizer) do_state_num_char_reference_end() {
+	if t.char_ref_code == 0x00 {
+		t.parse_error(.null_character_reference)
+		t.char_ref_code = 0xfffd
+	}
+
+	// extends range of unicode
+	if t.char_ref_code > 0x10ffff {
+		t.parse_error(.char_reference_outside_unicode_range)
+		t.char_ref_code = 0xfffd
+	}
+
+	// surrogate
+	if t.char_ref_code >= 0xd800 && t.char_ref_code <= 0xdfff {
+		t.parse_error(.surrogate_char_reference)
+		t.char_ref_code = 0xfffd
+	}
+
+	// noncharacter
+	if (t.char_ref_code >= 0xfdd0 && t.char_ref_code <= 0xfdef) || t.char_ref_code in [0xfffe, 0xffff, 0x1fffe, 0x1ffff, 0x2fffe, 0x2ffff, 0x3fffe, 0x3ffff, 0x4fffe, 0x4ffff, 0x5fffe, 0x5ffff, 0x6fffe, 0x6ffff, 0x7fffe, 0x7ffff, 0x8fffe, 0x8ffff, 0x9fffe, 0x9ffff, 0xafffe, 0xaffff, 0xbfffe, 0xbffff, 0xcfffe, 0xcffff, 0xdfffe, 0xdffff 0xefffe, 0xeffff, 0xffffe, 0xfffff, 0x10fffe, 0x10ffff] {
+		t.parse_error(.noncharacter_char_reference)
+	}
+
+	// control
+	if t.curr_char !in whitespace && (t.char_ref_code == 0x0d || (t.char_ref_code >= 0x007f && t.char_ref_code <= 0x009f) || (t.char_ref_code >= 0x0000 && t.char_ref_code <= 0x001f)) {
+		t.parse_error(.control_char_reference)
+		table := {
+			0x80: 0x20ac, 0x82: 0x201a, 0x83: 0x0192,
+			0x84: 0x201e, 0x85: 0x2026, 0x86: 0x2020,
+			0x87: 0x2021, 0x88: 0x02c6, 0x89: 0x2030,
+			0x8a: 0x0160, 0x8b: 0x2039, 0x8c: 0x0152,
+			0x8e: 0x017d, 0x91: 0x2018, 0x92: 0x2019,
+			0x93: 0x201c, 0x94: 0x201d, 0x95: 0x2022,
+			0x96: 0x2013, 0x97: 0x2014, 0x98: 0x02dc,
+			0x99: 0x2122, 0x9a: 0x0161, 0x9b: 0x203a,
+			0x9c: 0x0153, 0x9e: 0x017e, 0x9f: 0x0178
+		}
+		if t.char_ref_code in table.keys() {
+			t.char_ref_code = table[t.char_ref_code]
+		}
+	}
+
+	t.bldr = strings.new_builder(1)
+	t.bldr.write_rune(rune(t.char_ref_code))
+	t.flush_codepoints()
+	t.do_return_state(false)
 }
